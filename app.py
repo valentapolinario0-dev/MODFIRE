@@ -1,4 +1,5 @@
 import os, sqlite3, secrets, time
+from urllib.parse import quote
 from flask import Flask, request, session, redirect, Response, render_template_string, abort, g
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -6,7 +7,7 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("SECRET_KEY", "troque-esta-chave")
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123")  # TROQUE no servidor!
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin123").strip()  # TROQUE no servidor!
 DB = os.environ.get("DB_PATH", "scripts.db")
 
 
@@ -25,8 +26,24 @@ def close_db(_):
         d.close()
 
 
+def key_ok():
+    k = request.values.get("k", "")
+    return bool(k) and secrets.compare_digest(k.encode(), ADMIN_KEY.encode())
+
+
 def is_admin():
+    if key_ok():
+        session["ok"] = True
+        return True
     return session.get("ok") is True
+
+
+def kq():  # mantém a senha na URL caso o navegador bloqueie cookies
+    return "?k=" + quote(request.values["k"]) if key_ok() else ""
+
+
+def home():
+    return redirect("/" + kq())
 
 
 def get_or_404(sid):
@@ -51,11 +68,12 @@ pre{background:#171a21;padding:12px;border-radius:8px;overflow:auto;white-space:
 </style></head><body>
 <h1>📦 RawHub</h1>
 {% if not admin %}
+{% if erro %}<p style="color:#f87171">Senha incorreta. Confira a ADMIN_KEY no Render.</p>{% endif %}
 <form method="post" action="/login"><input type="password" name="key" placeholder="Senha de admin" required>
 <button>Entrar</button></form>
 {% else %}
 <form method="post" action="/logout" style="float:right"><button class="g">Sair</button></form>
-<form method="post" action="/new">
+<form method="post" action="/new{{ kq }}">
 <input name="name" placeholder="Nome do script" maxlength="80" required>
 <textarea name="code" placeholder="Cole o código aqui..." required></textarea>
 <button>Criar link</button></form>
@@ -65,10 +83,10 @@ pre{background:#171a21;padding:12px;border-radius:8px;overflow:auto;white-space:
 <div class="row">
 <button onclick="cp(this)" data-t='loadstring(game:HttpGet("{{ root }}{{ s['id'] }}"))()'>Copiar loadstring</button>
 <button class="g" onclick="cp(this)" data-t="{{ root }}{{ s['id'] }}">Copiar link</button>
-<a class="b g" href="/v/{{ s['id'] }}">Ver código</a>
+<a class="b g" href="/v/{{ s['id'] }}{{ kq }}">Ver código</a>
 <a class="b g" href="/{{ s['id'] }}" target="_blank">Raw</a>
-<a class="b g" href="/d/{{ s['id'] }}">Baixar</a>
-<form method="post" action="/del/{{ s['id'] }}" onsubmit="return confirm('Apagar?')"><button class="r">Apagar</button></form>
+<a class="b g" href="/d/{{ s['id'] }}{{ kq }}">Baixar</a>
+<form method="post" action="/del/{{ s['id'] }}{{ kq }}" onsubmit="return confirm('Apagar?')"><button class="r">Apagar</button></form>
 </div></div>
 {% else %}<p>Nenhum script ainda.</p>{% endfor %}
 {% endif %}
@@ -81,8 +99,8 @@ VIEW = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <style>:root{color-scheme:dark}body{font:15px system-ui;background:#0f1115;color:#e6e6e6;padding:16px;max-width:820px;margin:auto}
 pre{background:#171a21;padding:12px;border-radius:8px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:13px}
 .b{background:#3b82f6;color:#fff;border:0;border-radius:8px;padding:8px 12px;text-decoration:none;font:inherit;cursor:pointer}</style></head><body>
-<p><a class="b" href="/">← Voltar</a> <button class="b" id="c">Copiar código</button>
-<a class="b" href="/d/{{ s['id'] }}">Baixar</a></p>
+<p><a class="b" href="/{{ kq }}">← Voltar</a> <button class="b" id="c">Copiar código</button>
+<a class="b" href="/d/{{ s['id'] }}{{ kq }}">Baixar</a></p>
 <h3>{{ s['name'] }}</h3><pre id="code">{{ s['code'] }}</pre>
 <script>c.onclick=()=>navigator.clipboard.writeText(document.getElementById('code').textContent).then(()=>c.textContent='Copiado ✓')</script>
 </body></html>"""
@@ -91,14 +109,17 @@ pre{background:#171a21;padding:12px;border-radius:8px;overflow:auto;white-space:
 @app.get("/")
 def index():
     rows = db().execute("SELECT * FROM scripts ORDER BY created DESC").fetchall() if is_admin() else []
-    return render_template_string(PAGE, admin=is_admin(), rows=rows, root=request.url_root)
+    return render_template_string(PAGE, admin=is_admin(), rows=rows, root=request.url_root, erro=request.args.get('erro'), kq=kq())
 
 
 @app.post("/login")
 def login():
-    if secrets.compare_digest(request.form.get("key", ""), ADMIN_KEY):
+    key = request.form.get("key", "").strip()
+    if secrets.compare_digest(key.encode(), ADMIN_KEY.encode()):
+        session.permanent = True
         session["ok"] = True
-    return redirect("/")
+        return redirect("/?k=" + quote(key))
+    return redirect("/?erro=1")
 
 
 @app.post("/logout")
@@ -117,7 +138,7 @@ def new():
         db().execute("INSERT INTO scripts VALUES(?,?,?,?)",
                      (secrets.token_urlsafe(5), name, code, int(time.time())))
         db().commit()
-    return redirect("/")
+    return home()
 
 
 @app.post("/del/<sid>")
@@ -126,14 +147,14 @@ def delete(sid):
         abort(403)
     db().execute("DELETE FROM scripts WHERE id=?", (sid,))
     db().commit()
-    return redirect("/")
+    return home()
 
 
 @app.get("/v/<sid>")
 def view(sid):
     if not is_admin():
         abort(403)
-    return render_template_string(VIEW, s=get_or_404(sid))
+    return render_template_string(VIEW, s=get_or_404(sid), kq=kq())
 
 
 @app.get("/d/<sid>")
